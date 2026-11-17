@@ -1,4 +1,4 @@
-import os, asyncio, threading, traceback
+import os, asyncio, traceback
 from flask import Flask, request, abort
 from pymongo import MongoClient
 from telegram import (Update, InlineKeyboardButton as B,
@@ -17,12 +17,14 @@ client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client["tgbot"]
 topics = db["topics"]   # {_id: topic_id, name}
 posts = db["posts"]     # {t: topic_id, m: message_id}
-state = db["state"]     # {_id: user_id, t, old, ask}  (नंबर पूछने के लिए)
+state = db["state"]     # {_id: user_id, t, old, ask}
 
 try:
     posts.create_index([("t", 1), ("m", 1)], unique=True)
 except Exception:
     pass
+
+private = filters.ChatType.PRIVATE
 
 
 # ---------- helpers ----------
@@ -53,10 +55,10 @@ def topics_markup(page=0):
     return M(rows)
 
 def nav_markup(tid, idx, total):
-    g = lambda label, i: B(label, callback_data=f"g:{tid}:{i}")
+    def g(label, i):
+        return B(label, callback_data=f"g:{tid}:{i}")
     rows = []
 
-    # Prev / Next
     r = []
     if idx > 1:
         r.append(g("⬅️ Prev", idx - 1))
@@ -66,7 +68,6 @@ def nav_markup(tid, idx, total):
         r.append(g("🔁 शुरू से", 1))
     rows.append(r)
 
-    # 10 की छलांग
     r = []
     if idx > 1:
         r.append(g("⏪ -10", max(1, idx - 10)))
@@ -75,7 +76,6 @@ def nav_markup(tid, idx, total):
     if r:
         rows.append(r)
 
-    # 100 की छलांग
     if total > 100:
         r = []
         if idx > 1:
@@ -108,10 +108,11 @@ async def send_post(bot, chat, tid, idx, old=None, extra=()):
                 reply_markup=M([[B("🔙 Topics", callback_data="home")]]))
             break
         idx = max(1, min(int(idx), total))
-        doc = next(iter(posts.find({"t": tid}).sort("m", 1)
-                        .skip(idx - 1).limit(1)), None)
-        if not doc:
+        docs = list(posts.find({"t": tid}).sort("m", 1)
+                    .skip(idx - 1).limit(1))
+        if not docs:
             break
+        doc = docs[0]
         try:
             await bot.copy_message(
                 chat_id=chat, from_chat_id=GROUP_ID, message_id=doc["m"],
@@ -120,7 +121,8 @@ async def send_post(bot, chat, tid, idx, old=None, extra=()):
         except BadRequest:
             # group से post delete हो चुका: हटाकर वही नंबर दोबारा
             posts.delete_one({"_id": doc["_id"]})
-    await asyncio.gather(*[safe_delete(bot, chat, x) for x in [old, *extra]])
+    await asyncio.gather(
+        *[safe_delete(bot, chat, x) for x in [old, *extra]])
 
 
 # ---------- group में आने वाले messages सेव करना ----------
@@ -174,9 +176,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 कोई Topic चुनें:",
                                     reply_markup=topics_markup(0))
 
-async def cb_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-
 async def cb_home(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     chat = q.message.chat_id
@@ -202,7 +201,7 @@ async def cb_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                   old=q.message.message_id))
 
 async def cb_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """g:topic:नंबर  (Next, Prev, +10, +100 सब यही)"""
+    """g:topic:नंबर (Next, Prev, ±10, ±100 सब यही)"""
     q = update.callback_query
     _, tid, idx = q.data.split(":")
     await asyncio.gather(
@@ -221,7 +220,8 @@ async def cb_jump(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🔢 1 से {total} के बीच post का नंबर भेजें:")
     state.update_one(
         {"_id": q.from_user.id},
-        {"$set": {"t": tid, "old": q.message.message_id, "ask": ask.message_id}},
+        {"$set": {"t": tid, "old": q.message.message_id,
+                  "ask": ask.message_id}},
         upsert=True)
 
 async def on_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -238,35 +238,31 @@ async def on_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     old=st["old"], extra=[st["ask"], m.message_id])
 
 
-# ---------- webhook (Application सिर्फ़ एक बार बनता है) ----------
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-lock = threading.Lock()
-ready = False
-
-application = Application.builder().token(TOKEN).updater(None).build()
-private = filters.ChatType.PRIVATE
-application.add_handler(CommandHandler("start", start, private))
-application.add_handler(CommandHandler("addtopic", addtopic,
-                                       filters.Chat(GROUP_ID)))
-application.add_handler(CommandHandler("save", savepost,
-                                       filters.Chat(GROUP_ID)))
-application.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
-application.add_handler(CallbackQueryHandler(cb_home, pattern=r"^home$"))
-application.add_handler(CallbackQueryHandler(cb_page, pattern=r"^pg:\d+$"))
-application.add_handler(CallbackQueryHandler(cb_topic, pattern=r"^t:\d+$"))
-application.add_handler(CallbackQueryHandler(cb_go, pattern=r"^g:\d+:\d+$"))
-application.add_handler(CallbackQueryHandler(cb_jump, pattern=r"^j:\d+$"))
-application.add_handler(MessageHandler(
-    private & filters.TEXT & ~filters.COMMAND, on_number))
-application.add_handler(MessageHandler(filters.Chat(GROUP_ID), track))
+# ---------- webhook ----------
+def build_app():
+    application = (Application.builder().token(TOKEN)
+                   .updater(None).build())
+    application.add_handler(CommandHandler("start", start, private))
+    application.add_handler(CommandHandler("addtopic", addtopic,
+                                           filters.Chat(GROUP_ID)))
+    application.add_handler(CommandHandler("save", savepost,
+                                           filters.Chat(GROUP_ID)))
+    application.add_handler(CallbackQueryHandler(cb_home, pattern=r"^home$"))
+    application.add_handler(CallbackQueryHandler(cb_page, pattern=r"^pg:\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_topic, pattern=r"^t:\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_go,
+                                                 pattern=r"^g:\d+:\d+$"))
+    application.add_handler(CallbackQueryHandler(cb_jump, pattern=r"^j:\d+$"))
+    application.add_handler(MessageHandler(
+        private & filters.TEXT & ~filters.COMMAND, on_number))
+    application.add_handler(MessageHandler(filters.Chat(GROUP_ID), track))
+    return application
 
 async def process(data):
-    global ready
-    if not ready:
-        await application.initialize()
-        ready = True
-    await application.process_update(Update.de_json(data, application.bot))
+    application = build_app()
+    async with application:
+        await application.process_update(
+            Update.de_json(data, application.bot))
 
 app = Flask(__name__)
 
@@ -281,8 +277,7 @@ def webhook(path):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
         abort(403)
     try:
-        with lock:
-            loop.run_until_complete(process(request.get_json(force=True)))
+        asyncio.run(process(request.get_json(force=True)))
     except Exception:
         traceback.print_exc()
     return "ok"
