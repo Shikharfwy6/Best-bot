@@ -17,6 +17,8 @@ topics = db["topics"]   # {_id: topic_id, name}
 posts = db["posts"]     # {t: topic_id, m: message_id}
 pos = db["pos"]         # {_id: "user:topic", m: last_message_id}
 
+
+# ---------- helpers ----------
 def save_topic(tid, name):
     topics.update_one({"_id": int(tid)}, {"$set": {"name": name}}, upsert=True)
 
@@ -46,6 +48,13 @@ def topics_markup(page=0):
 def next_markup(tid):
     return M([[B("➡️ Next post", callback_data=f"n:{tid}")],
               [B("🔙 Topics", callback_data="home")]])
+
+async def safe_delete(bot, chat, mid):
+    try:
+        await bot.delete_message(chat, mid)
+    except Exception:
+        pass
+
 
 # ---------- group में आने वाले messages सेव करना ----------
 async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -90,6 +99,7 @@ async def savepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_post(tid, r.message_id)
     await m.reply_text("✅ Post सेव हो गया")
 
+
 # ---------- user वाला हिस्सा ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 कोई Topic चुनें:",
@@ -98,8 +108,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_home(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await ctx.bot.send_message(q.message.chat_id, "📚 कोई Topic चुनें:",
+    chat = q.message.chat_id
+    await ctx.bot.send_message(chat, "📚 कोई Topic चुनें:",
                                reply_markup=topics_markup(0))
+    await safe_delete(ctx.bot, chat, q.message.message_id)
 
 async def cb_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -111,16 +123,18 @@ async def cb_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     tid = int(q.data.split(":")[1])
+    chat = q.message.chat_id
     pos.delete_one({"_id": f"{q.from_user.id}:{tid}"})  # शुरू से
     count = posts.count_documents({"t": tid})
     if count == 0:
         await ctx.bot.send_message(
-            q.message.chat_id, "इस topic में अभी कोई post सेव नहीं है।",
+            chat, "इस topic में अभी कोई post सेव नहीं है।",
             reply_markup=M([[B("🔙 Topics", callback_data="home")]]))
-        return
-    await ctx.bot.send_message(
-        q.message.chat_id, f"📂 {topic_name(tid)}\nकुल posts: {count}",
-        reply_markup=next_markup(tid))
+    else:
+        await ctx.bot.send_message(
+            chat, f"📂 {topic_name(tid)}\nकुल posts: {count}",
+            reply_markup=next_markup(tid))
+    await safe_delete(ctx.bot, chat, q.message.message_id)
 
 async def cb_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -130,11 +144,7 @@ async def cb_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = pos.find_one({"_id": key})
     last = doc["m"] if doc else 0
     chat = q.message.chat_id
-
-    try:  # पुराने message से button हटाएं, ताकि सिर्फ़ नया button रहे
-        await q.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    old = q.message.message_id  # जिस post पर बटन दबाया गया
 
     while True:
         nxt = posts.find_one({"t": tid, "m": {"$gt": last}}, sort=[("m", 1)])
@@ -143,18 +153,24 @@ async def cb_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 chat, "✅ इस topic के सारे posts देख लिए।",
                 reply_markup=M([[B("🔁 शुरू से", callback_data=f"t:{tid}")],
                                 [B("🔙 Topics", callback_data="home")]]))
+            await safe_delete(ctx.bot, chat, old)
             return
         try:
+            # पहले नया post भेजें
             await ctx.bot.copy_message(
                 chat_id=chat, from_chat_id=GROUP_ID,
                 message_id=nxt["m"], reply_markup=next_markup(tid))
             pos.update_one({"_id": key}, {"$set": {"m": nxt["m"]}}, upsert=True)
+            # फिर पुराना post delete करें
+            await safe_delete(ctx.bot, chat, old)
             return
         except Exception:
-            # post delete हो चुका होगा: हटाकर अगले पर जाएं
+            # group का post delete हो चुका होगा: हटाकर अगले पर जाएं
             posts.delete_one({"_id": nxt["_id"]})
             last = nxt["m"]
 
+
+# ---------- webhook ----------
 async def process(data):
     application = Application.builder().token(TOKEN).updater(None).build()
     private = filters.ChatType.PRIVATE
