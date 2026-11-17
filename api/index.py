@@ -1,8 +1,9 @@
-import os, asyncio
+import os, asyncio, threading, traceback
 from flask import Flask, request, abort
 from pymongo import MongoClient
 from telegram import (Update, InlineKeyboardButton as B,
                       InlineKeyboardMarkup as M)
+from telegram.error import BadRequest
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, filters, ContextTypes)
 
@@ -12,10 +13,16 @@ SECRET = os.environ.get("WEBHOOK_SECRET", "mysecret123")
 GROUP_ID = -1003701041040
 PER_PAGE = 20
 
-db = MongoClient(MONGO_URI)["tgbot"]
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
+db = client["tgbot"]
 topics = db["topics"]   # {_id: topic_id, name}
 posts = db["posts"]     # {t: topic_id, m: message_id}
-pos = db["pos"]         # {_id: "user:topic", m: last_message_id}
+state = db["state"]     # {_id: user_id, t, old, ask}  (नंबर पूछने के लिए)
+
+try:
+    posts.create_index([("t", 1), ("m", 1)], unique=True)
+except Exception:
+    pass
 
 
 # ---------- helpers ----------
@@ -45,15 +52,75 @@ def topics_markup(page=0):
         rows.append(nav)
     return M(rows)
 
-def next_markup(tid):
-    return M([[B("➡️ Next post", callback_data=f"n:{tid}")],
-              [B("🔙 Topics", callback_data="home")]])
+def nav_markup(tid, idx, total):
+    g = lambda label, i: B(label, callback_data=f"g:{tid}:{i}")
+    rows = []
+
+    # Prev / Next
+    r = []
+    if idx > 1:
+        r.append(g("⬅️ Prev", idx - 1))
+    if idx < total:
+        r.append(g("Next ➡️", idx + 1))
+    else:
+        r.append(g("🔁 शुरू से", 1))
+    rows.append(r)
+
+    # 10 की छलांग
+    r = []
+    if idx > 1:
+        r.append(g("⏪ -10", max(1, idx - 10)))
+    if idx < total:
+        r.append(g("⏩ +10", min(total, idx + 10)))
+    if r:
+        rows.append(r)
+
+    # 100 की छलांग
+    if total > 100:
+        r = []
+        if idx > 1:
+            r.append(g("⏪ -100", max(1, idx - 100)))
+        if idx < total:
+            r.append(g("⏩ +100", min(total, idx + 100)))
+        if r:
+            rows.append(r)
+
+    rows.append([B(f"🔢 {idx}/{total} • नंबर पर जाएं",
+                   callback_data=f"j:{tid}")])
+    rows.append([B("🔙 Topics", callback_data="home")])
+    return M(rows)
 
 async def safe_delete(bot, chat, mid):
+    if not mid:
+        return
     try:
         await bot.delete_message(chat, mid)
     except Exception:
         pass
+
+async def send_post(bot, chat, tid, idx, old=None, extra=()):
+    """topic tid का idx-वाँ post भेजो, फिर पुराने messages हटाओ"""
+    while True:
+        total = posts.count_documents({"t": tid})
+        if total == 0:
+            await bot.send_message(
+                chat, "इस topic में अभी कोई post सेव नहीं है।",
+                reply_markup=M([[B("🔙 Topics", callback_data="home")]]))
+            break
+        idx = max(1, min(int(idx), total))
+        doc = next(iter(posts.find({"t": tid}).sort("m", 1)
+                        .skip(idx - 1).limit(1)), None)
+        if not doc:
+            break
+        try:
+            await bot.copy_message(
+                chat_id=chat, from_chat_id=GROUP_ID, message_id=doc["m"],
+                reply_markup=nav_markup(tid, idx, total))
+            break
+        except BadRequest:
+            # group से post delete हो चुका: हटाकर वही नंबर दोबारा
+            posts.delete_one({"_id": doc["_id"]})
+    await asyncio.gather(*[safe_delete(bot, chat, x) for x in [old, *extra]])
 
 
 # ---------- group में आने वाले messages सेव करना ----------
@@ -76,10 +143,13 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tid = m.message_thread_id if m.is_topic_message else 1
     save_post(tid, m.message_id)
 
+async def is_admin(ctx, user_id):
+    member = await ctx.bot.get_chat_member(GROUP_ID, user_id)
+    return member.status in ("administrator", "creator")
+
 async def addtopic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
-    member = await ctx.bot.get_chat_member(GROUP_ID, update.effective_user.id)
-    if member.status not in ("administrator", "creator"):
+    if not await is_admin(ctx, update.effective_user.id):
         return
     tid = m.message_thread_id if m.is_topic_message else 1
     name = " ".join(ctx.args) or f"Topic {tid}"
@@ -89,8 +159,7 @@ async def addtopic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def savepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """किसी पुराने post पर reply करके /save लिखें (सिर्फ़ admin)"""
     m = update.effective_message
-    member = await ctx.bot.get_chat_member(GROUP_ID, update.effective_user.id)
-    if member.status not in ("administrator", "creator"):
+    if not await is_admin(ctx, update.effective_user.id):
         return
     r = m.reply_to_message
     if not r:
@@ -105,12 +174,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📚 कोई Topic चुनें:",
                                     reply_markup=topics_markup(0))
 
+async def cb_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+
 async def cb_home(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     chat = q.message.chat_id
-    await ctx.bot.send_message(chat, "📚 कोई Topic चुनें:",
-                               reply_markup=topics_markup(0))
+    await asyncio.gather(
+        q.answer(),
+        ctx.bot.send_message(chat, "📚 कोई Topic चुनें:",
+                             reply_markup=topics_markup(0)))
     await safe_delete(ctx.bot, chat, q.message.message_id)
 
 async def cb_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -120,73 +193,80 @@ async def cb_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.message.edit_reply_markup(reply_markup=topics_markup(page))
 
 async def cb_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """topic चुनते ही उसका पहला post दिखाओ"""
+    q = update.callback_query
+    tid = int(q.data.split(":")[1])
+    await asyncio.gather(
+        q.answer(),
+        send_post(ctx.bot, q.message.chat_id, tid, 1,
+                  old=q.message.message_id))
+
+async def cb_go(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """g:topic:नंबर  (Next, Prev, +10, +100 सब यही)"""
+    q = update.callback_query
+    _, tid, idx = q.data.split(":")
+    await asyncio.gather(
+        q.answer(),
+        send_post(ctx.bot, q.message.chat_id, int(tid), int(idx),
+                  old=q.message.message_id))
+
+async def cb_jump(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """🔢 बटन: user से post नंबर पूछो"""
     q = update.callback_query
     await q.answer()
     tid = int(q.data.split(":")[1])
-    chat = q.message.chat_id
-    pos.delete_one({"_id": f"{q.from_user.id}:{tid}"})  # शुरू से
-    count = posts.count_documents({"t": tid})
-    if count == 0:
-        await ctx.bot.send_message(
-            chat, "इस topic में अभी कोई post सेव नहीं है।",
-            reply_markup=M([[B("🔙 Topics", callback_data="home")]]))
-    else:
-        await ctx.bot.send_message(
-            chat, f"📂 {topic_name(tid)}\nकुल posts: {count}",
-            reply_markup=next_markup(tid))
-    await safe_delete(ctx.bot, chat, q.message.message_id)
+    total = posts.count_documents({"t": tid})
+    ask = await ctx.bot.send_message(
+        q.message.chat_id,
+        f"🔢 1 से {total} के बीच post का नंबर भेजें:")
+    state.update_one(
+        {"_id": q.from_user.id},
+        {"$set": {"t": tid, "old": q.message.message_id, "ask": ask.message_id}},
+        upsert=True)
 
-async def cb_next(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    tid = int(q.data.split(":")[1])
-    key = f"{q.from_user.id}:{tid}"
-    doc = pos.find_one({"_id": key})
-    last = doc["m"] if doc else 0
-    chat = q.message.chat_id
-    old = q.message.message_id  # जिस post पर बटन दबाया गया
-
-    while True:
-        nxt = posts.find_one({"t": tid, "m": {"$gt": last}}, sort=[("m", 1)])
-        if not nxt:
-            await ctx.bot.send_message(
-                chat, "✅ इस topic के सारे posts देख लिए।",
-                reply_markup=M([[B("🔁 शुरू से", callback_data=f"t:{tid}")],
-                                [B("🔙 Topics", callback_data="home")]]))
-            await safe_delete(ctx.bot, chat, old)
-            return
-        try:
-            # पहले नया post भेजें
-            await ctx.bot.copy_message(
-                chat_id=chat, from_chat_id=GROUP_ID,
-                message_id=nxt["m"], reply_markup=next_markup(tid))
-            pos.update_one({"_id": key}, {"$set": {"m": nxt["m"]}}, upsert=True)
-            # फिर पुराना post delete करें
-            await safe_delete(ctx.bot, chat, old)
-            return
-        except Exception:
-            # group का post delete हो चुका होगा: हटाकर अगले पर जाएं
-            posts.delete_one({"_id": nxt["_id"]})
-            last = nxt["m"]
+async def on_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    m = update.message
+    st = state.find_one({"_id": m.from_user.id})
+    if not st:
+        return
+    txt = m.text.strip()
+    if not txt.isdigit() or int(txt) < 1:
+        await m.reply_text("❌ सिर्फ़ नंबर भेजें (जैसे 25)")
+        return
+    state.delete_one({"_id": m.from_user.id})
+    await send_post(ctx.bot, m.chat_id, st["t"], int(txt),
+                    old=st["old"], extra=[st["ask"], m.message_id])
 
 
-# ---------- webhook ----------
+# ---------- webhook (Application सिर्फ़ एक बार बनता है) ----------
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+lock = threading.Lock()
+ready = False
+
+application = Application.builder().token(TOKEN).updater(None).build()
+private = filters.ChatType.PRIVATE
+application.add_handler(CommandHandler("start", start, private))
+application.add_handler(CommandHandler("addtopic", addtopic,
+                                       filters.Chat(GROUP_ID)))
+application.add_handler(CommandHandler("save", savepost,
+                                       filters.Chat(GROUP_ID)))
+application.add_handler(CallbackQueryHandler(cb_noop, pattern=r"^noop$"))
+application.add_handler(CallbackQueryHandler(cb_home, pattern=r"^home$"))
+application.add_handler(CallbackQueryHandler(cb_page, pattern=r"^pg:\d+$"))
+application.add_handler(CallbackQueryHandler(cb_topic, pattern=r"^t:\d+$"))
+application.add_handler(CallbackQueryHandler(cb_go, pattern=r"^g:\d+:\d+$"))
+application.add_handler(CallbackQueryHandler(cb_jump, pattern=r"^j:\d+$"))
+application.add_handler(MessageHandler(
+    private & filters.TEXT & ~filters.COMMAND, on_number))
+application.add_handler(MessageHandler(filters.Chat(GROUP_ID), track))
+
 async def process(data):
-    application = Application.builder().token(TOKEN).updater(None).build()
-    private = filters.ChatType.PRIVATE
-    application.add_handler(CommandHandler("start", start, private))
-    application.add_handler(CommandHandler("addtopic", addtopic,
-                                           filters.Chat(GROUP_ID)))
-    application.add_handler(CommandHandler("save", savepost,
-                                           filters.Chat(GROUP_ID)))
-    application.add_handler(CallbackQueryHandler(cb_home, pattern=r"^home$"))
-    application.add_handler(CallbackQueryHandler(cb_page, pattern=r"^pg:\d+$"))
-    application.add_handler(CallbackQueryHandler(cb_topic, pattern=r"^t:\d+$"))
-    application.add_handler(CallbackQueryHandler(cb_next, pattern=r"^n:\d+$"))
-    application.add_handler(MessageHandler(filters.Chat(GROUP_ID), track))
-    await application.initialize()
+    global ready
+    if not ready:
+        await application.initialize()
+        ready = True
     await application.process_update(Update.de_json(data, application.bot))
-    await application.shutdown()
 
 app = Flask(__name__)
 
@@ -200,5 +280,9 @@ def home(path):
 def webhook(path):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
         abort(403)
-    asyncio.run(process(request.get_json(force=True)))
+    try:
+        with lock:
+            loop.run_until_complete(process(request.get_json(force=True)))
+    except Exception:
+        traceback.print_exc()
     return "ok"
