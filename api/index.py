@@ -67,12 +67,15 @@ async def process(data):
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def home():
+
+@app.route("/", defaults={"path": ""}, methods=["GET"])
+@app.route("/<path:path>", methods=["GET"])
+def home(path):
     return "Bot चल रहा है ✅"
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+@app.route("/", defaults={"path": ""}, methods=["POST"])
+@app.route("/<path:path>", methods=["POST"])
+def webhook(path):
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
         abort(403)
     asyncio.run(process(request.get_json(force=True)))
