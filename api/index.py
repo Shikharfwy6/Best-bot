@@ -1,4 +1,4 @@
-import os, asyncio, traceback
+import os, asyncio, traceback, time
 from flask import Flask, request, abort
 from pymongo import MongoClient
 from telegram import (Update, InlineKeyboardButton as B,
@@ -12,13 +12,15 @@ MONGO_URI = os.environ["MONGO_URI"]
 SECRET = os.environ.get("WEBHOOK_SECRET", "mysecret123")
 GROUP_ID = -1003701041040
 PER_PAGE = 20
+WAIT = 8  # नए posts का इंतज़ार (सेकंड)
 
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client["tgbot"]
-topics = db["topics"]   # {_id: topic_id, name}
-posts = db["posts"]     # {t: topic_id, m: message_id}
-state = db["state"]     # {_id: user_id, t, old, ask}
-users = db["users"]     # {_id: user_id}  (जिन्होंने /start किया)
+topics = db["topics"]    # {_id: topic_id, name}
+posts = db["posts"]      # {t: topic_id, m: message_id}
+state = db["state"]      # {_id: user_id, t, old, ask}
+users = db["users"]      # {_id: user_id}  (जिन्होंने /start किया)
+pending = db["pending"]  # {_id: topic_id, count, first, seq}
 
 try:
     posts.create_index([("t", 1), ("m", 1)], unique=True)
@@ -187,10 +189,31 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # नया post
     tid = m.message_thread_id if m.is_topic_message else 1
     if save_post(tid, m.message_id):
-        n = posts.count_documents({"t": tid})
-        await broadcast(
-            ctx.bot, f"📬 {n} Post added in: {topic_name(tid)}",
-            M([[B("👀 Post देखें", callback_data=f"g:{tid}:{n}")]]))
+        total = posts.count_documents({"t": tid})
+        my = str(time.time_ns())
+        pending.update_one(
+            {"_id": tid},
+            {"$inc": {"count": 1}, "$set": {"seq": my},
+             "$min": {"first": total}},
+            upsert=True)
+
+        await asyncio.sleep(WAIT)
+
+        # सिर्फ़ सबसे आख़िरी post वाला function ही ये claim कर पाएगा
+        doc = pending.find_one_and_delete({"_id": tid, "seq": my})
+        if not doc:
+            return
+
+        c, first = doc["count"], doc["first"]
+        name = topic_name(tid)
+        if c == 1:
+            text = f"📬 1 New post added in: {name}"
+            label = "👀 Post देखें"
+        else:
+            text = f"📬 {c} New posts added in: {name}"
+            label = "👀 पहला नया post देखें"
+        await broadcast(ctx.bot, text,
+                        M([[B(label, callback_data=f"g:{tid}:{first}")]]))
 
 async def is_admin(ctx, user_id):
     member = await ctx.bot.get_chat_member(GROUP_ID, user_id)
