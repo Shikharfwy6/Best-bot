@@ -12,7 +12,7 @@ MONGO_URI = os.environ["MONGO_URI"]
 SECRET = os.environ.get("WEBHOOK_SECRET", "mysecret123")
 GROUP_ID = -1003701041040
 PER_PAGE = 20
-WAIT = 8  # नए posts का इंतज़ार (सेकंड)
+WAIT = 6  # आख़िरी post के बाद इतने सेकंड शांति रहे तो broadcast जाए
 
 client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=8000)
 db = client["tgbot"]
@@ -20,7 +20,7 @@ topics = db["topics"]    # {_id: topic_id, name}
 posts = db["posts"]      # {t: topic_id, m: message_id}
 state = db["state"]      # {_id: user_id, t, old, ask}
 users = db["users"]      # {_id: user_id}  (जिन्होंने /start किया)
-pending = db["pending"]  # {_id: topic_id, count, first, seq}
+pending = db["pending"]  # {_id: topic_id, count, first, last}
 
 try:
     posts.create_index([("t", 1), ("m", 1)], unique=True)
@@ -190,17 +190,28 @@ async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tid = m.message_thread_id if m.is_topic_message else 1
     if save_post(tid, m.message_id):
         total = posts.count_documents({"t": tid})
-        my = str(time.time_ns())
         pending.update_one(
             {"_id": tid},
-            {"$inc": {"count": 1}, "$set": {"seq": my},
+            {"$inc": {"count": 1},
+             "$max": {"last": time.time()},
              "$min": {"first": total}},
             upsert=True)
 
-        await asyncio.sleep(WAIT)
+        # हर function बार-बार जाँचता है कि नया post आना बंद हुआ या नहीं
+        doc = None
+        for _ in range(WAIT + 6):
+            await asyncio.sleep(1)
+            doc = pending.find_one({"_id": tid})
+            if not doc:
+                return  # किसी और function ने भेज दिया
+            if time.time() - doc["last"] >= WAIT:
+                break
+        else:
+            return
 
-        # सिर्फ़ सबसे आख़िरी post वाला function ही ये claim कर पाएगा
-        doc = pending.find_one_and_delete({"_id": tid, "seq": my})
+        # सिर्फ़ एक function ही ये delete कर पाएगा
+        doc = pending.find_one_and_delete(
+            {"_id": tid, "last": doc["last"]})
         if not doc:
             return
 
