@@ -3,7 +3,7 @@ from flask import Flask, request, abort
 from pymongo import MongoClient
 from telegram import (Update, InlineKeyboardButton as B,
                       InlineKeyboardMarkup as M)
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                           CallbackQueryHandler, filters, ContextTypes)
 
@@ -18,6 +18,7 @@ db = client["tgbot"]
 topics = db["topics"]   # {_id: topic_id, name}
 posts = db["posts"]     # {t: topic_id, m: message_id}
 state = db["state"]     # {_id: user_id, t, old, ask}
+users = db["users"]     # {_id: user_id}  (जिन्होंने /start किया)
 
 try:
     posts.create_index([("t", 1), ("m", 1)], unique=True)
@@ -29,11 +30,17 @@ private = filters.ChatType.PRIVATE
 
 # ---------- helpers ----------
 def save_topic(tid, name):
-    topics.update_one({"_id": int(tid)}, {"$set": {"name": name}}, upsert=True)
+    """नया topic बना तो True, पहले से था तो False"""
+    r = topics.update_one({"_id": int(tid)}, {"$set": {"name": name}},
+                          upsert=True)
+    return r.upserted_id is not None
 
 def save_post(tid, mid):
-    posts.update_one({"t": int(tid), "m": int(mid)},
-                     {"$set": {"t": int(tid), "m": int(mid)}}, upsert=True)
+    """नया post जुड़ा तो True, पहले से था तो False"""
+    r = posts.update_one({"t": int(tid), "m": int(mid)},
+                         {"$set": {"t": int(tid), "m": int(mid)}},
+                         upsert=True)
+    return r.upserted_id is not None
 
 def topic_name(tid):
     t = topics.find_one({"_id": int(tid)})
@@ -98,6 +105,30 @@ async def safe_delete(bot, chat, mid):
     except Exception:
         pass
 
+async def broadcast(bot, text, markup=None):
+    """/start करने वाले सभी users को message भेजो"""
+    ids = [u["_id"] for u in users.find({}, {"_id": 1})]
+    if not ids:
+        return
+    sem = asyncio.Semaphore(25)  # Telegram की speed limit के अंदर
+
+    async def one(uid):
+        async with sem:
+            for _ in range(2):
+                try:
+                    await bot.send_message(uid, text, reply_markup=markup)
+                    return
+                except RetryAfter as e:
+                    await asyncio.sleep(min(e.retry_after, 5))
+                except Forbidden:
+                    # user ने bot block किया: list से हटाएं
+                    users.delete_one({"_id": uid})
+                    return
+                except Exception:
+                    return
+
+    await asyncio.gather(*[one(u) for u in ids])
+
 async def send_post(bot, chat, tid, idx, old=None, extra=()):
     """topic tid का idx-वाँ post भेजो, फिर पुराने messages हटाओ"""
     while True:
@@ -125,25 +156,41 @@ async def send_post(bot, chat, tid, idx, old=None, extra=()):
         *[safe_delete(bot, chat, x) for x in [old, *extra]])
 
 
-# ---------- group में आने वाले messages सेव करना ----------
+# ---------- group में आने वाले messages सेव करना + broadcast ----------
 async def track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = update.effective_message
     if not m or m.chat_id != GROUP_ID:
         return
+
+    # नया topic
     if m.forum_topic_created:
-        save_topic(m.message_thread_id, m.forum_topic_created.name)
+        tid = m.message_thread_id
+        name = m.forum_topic_created.name
+        if save_topic(tid, name):
+            await broadcast(
+                ctx.bot, f"🆕 New topic add: {name}",
+                M([[B("📂 Topic खोलें", callback_data=f"t:{tid}")]]))
         return
+
+    # topic का नाम बदला (broadcast नहीं होगा)
     if m.forum_topic_edited:
         if m.forum_topic_edited.name:
             save_topic(m.message_thread_id, m.forum_topic_edited.name)
         return
+
     has_content = any([m.text, m.caption, m.photo, m.video, m.document,
                        m.audio, m.voice, m.animation, m.sticker,
                        m.video_note, m.poll, m.location, m.contact])
     if not has_content or (m.text and m.text.startswith("/")):
         return
+
+    # नया post
     tid = m.message_thread_id if m.is_topic_message else 1
-    save_post(tid, m.message_id)
+    if save_post(tid, m.message_id):
+        n = posts.count_documents({"t": tid})
+        await broadcast(
+            ctx.bot, f"📬 {n} Post added in: {topic_name(tid)}",
+            M([[B("👀 Post देखें", callback_data=f"g:{tid}:{n}")]]))
 
 async def is_admin(ctx, user_id):
     member = await ctx.bot.get_chat_member(GROUP_ID, user_id)
@@ -155,7 +202,7 @@ async def addtopic(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     tid = m.message_thread_id if m.is_topic_message else 1
     name = " ".join(ctx.args) or f"Topic {tid}"
-    save_topic(tid, name)
+    save_topic(tid, name)  # पुराने topic का नाम सेव: broadcast नहीं
     await m.reply_text(f"✅ Topic सेव: {name}")
 
 async def savepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -167,12 +214,15 @@ async def savepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not r:
         return
     tid = r.message_thread_id if r.is_topic_message else 1
-    save_post(tid, r.message_id)
+    save_post(tid, r.message_id)  # पुराना post: broadcast नहीं
     await m.reply_text("✅ Post सेव हो गया")
 
 
 # ---------- user वाला हिस्सा ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    users.update_one({"_id": u.id}, {"$set": {"name": u.first_name}},
+                     upsert=True)
     await update.message.reply_text("📚 कोई Topic चुनें:",
                                     reply_markup=topics_markup(0))
 
